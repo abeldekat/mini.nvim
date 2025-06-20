@@ -387,7 +387,9 @@ MiniJump2d.start = function(opts)
   end
 
   local label_tbl = vim.split(opts.labels, '')
-  spots = H.spots_add_steps(spots, label_tbl, opts.view.n_steps_ahead)
+
+  local spots_add_steps = H.cache.spots_add_steps and H.cache.spots_add_steps or H.spots_add_steps
+  spots = spots_add_steps(spots, label_tbl, opts.view.n_steps_ahead)
 
   H.spots_show(spots, opts)
 
@@ -401,6 +403,7 @@ MiniJump2d.stop = function()
   H.spots_unshow()
   H.cache.spots = nil
   H.cache.msg_shown = false
+  H.cache.spots_add_steps = nil
   vim.cmd('redraw')
 
   if H.cache.is_in_getcharstr then vim.api.nvim_input('<C-c>') end
@@ -686,6 +689,37 @@ MiniJump2d.builtin_opts.single_character = user_input_opts(
   function() return H.getcharstr('Enter single character to search') end
 )
 
+--- Jump to single character taken from user input, ensuring that the second
+--- character of each spot is always included in the generated steps
+--- If target is last on the line, second char is hardcoded to space.
+---
+--- Defines `spotter`, `allowed_lines.blank`, `allowed_lines.fold`,
+--- `overrides.spots_add_steps`, and `hooks.before_start`.
+MiniJump2d.builtin_opts.single_character_extended = user_input_opts(function()
+  H.cache.spots_add_steps = function(spots, label_tbl, n_steps_ahead)
+    n_steps_ahead = n_steps_ahead == 0 and 1 or n_steps_ahead
+    if spots[1].steps then return H.spots_add_steps(spots, label_tbl, n_steps_ahead) end
+
+    local spots_by_second_character = {}
+    for _, spot in ipairs(spots) do
+      local line = vim.api.nvim_buf_get_lines(spot.buf_id, spot.line - 1, spot.line, false)[1]
+
+      local char = line:sub(spot.column + 1, spot.column + 1)
+      char = char == '' and ' ' or char -- use space on line end...
+      spots_by_second_character[char] = spots_by_second_character[char] or {}
+      table.insert(spots_by_second_character[char], spot)
+    end
+
+    for char, spots_with_char in pairs(spots_by_second_character) do
+      local opts = { init_steps = function() return { char } end }
+      H.spots_add_steps(spots_with_char, label_tbl, n_steps_ahead, opts)
+    end
+
+    return spots
+  end
+  return H.getcharstr('Enter single character to search')
+end)
+
 --- Jump to query taken from user input
 ---
 --- Defines `spotter`, `allowed_lines.blank`, `allowed_lines.fold`, and
@@ -713,6 +747,9 @@ H.cache = {
 
   -- Whether helper message was shown
   msg_shown = false,
+
+  -- Whether to use a customized H.spots_add_steps
+  spots_add_steps = nil,
 }
 
 -- Table with special keys
@@ -840,11 +877,17 @@ H.spots_compute = function(opts)
   return res
 end
 
-H.spots_add_steps = function(spots, label_tbl, n_steps_ahead)
+---@param opts table|nil Allowed fields:
+---   - <init_steps> - function returning an array of initial `steps`.
+---@return nil Modifies `spots` in place.
+---@private
+H.spots_add_steps = function(spots, label_tbl, n_steps_ahead, opts)
+  opts = opts or {}
+
   -- Compute all required steps
   local steps = {}
   for _ = 1, #spots do
-    table.insert(steps, {})
+    table.insert(steps, opts.init_steps == nil and {} or opts.init_steps())
   end
 
   H.populate_spot_steps(steps, label_tbl, 1, n_steps_ahead + 1)
@@ -1041,13 +1084,13 @@ H.advance_jump = function(opts)
   end
 
   local key = H.getcharstr('Enter encoding symbol to advance jump')
-
-  if vim.tbl_contains(label_tbl, key) then
+  if not (key == H.keys.cr or key == H.keys.esc or key == H.keys.block_operator_pending) then
     H.spots_unshow(spots)
     spots = vim.tbl_filter(function(x) return x.steps[1] == key end, spots)
 
     if #spots > 1 then
-      spots = H.spots_add_steps(spots, label_tbl, n_steps_ahead)
+      local spots_add_steps = H.cache.spots_add_steps and H.cache.spots_add_steps or H.spots_add_steps
+      spots = spots_add_steps(spots, label_tbl, n_steps_ahead)
       H.spots_show(spots, opts)
       H.cache.spots = spots
 
