@@ -328,14 +328,16 @@ MiniJump2d.config = {
 ---@param opts table|nil Configuration of jumping, overriding global and buffer
 ---   local values. Has the same structure as |MiniJump2d.config|
 ---   without <mappings> field. Extra allowed fields:
----   - <hl_group> - highlight group for first step.
----     Default: `"MiniJump2dSpot"`.
----   - <hl_group_ahead> - highlight group for second and later steps.
----     Default: `"MiniJump2dSpotAhead"`.
----   - <hl_group_dim> - highlight group for dimming used lines.
----     Default: `"MiniJump2dDim"`.
----   - <hl_group_unique> - highlight group for unique next step.
----     Default: `"MiniJump2dSpotUnique"`.
+---     - <hl_group> - highlight group for first step.
+---       Default: `"MiniJump2dSpot"`.
+---     - <hl_group_ahead> - highlight group for second and later steps.
+---       Default: `"MiniJump2dSpotAhead"`.
+---     - <hl_group_dim> - highlight group for dimming used lines.
+---       Default: `"MiniJump2dDim"`.
+---     - <hl_group_unique> - highlight group for unique next step.
+---       Default: `"MiniJump2dSpotUnique"`.
+---     - <force_filtering> - prevent immediate jump to single spot.
+---       Default: `false`.
 ---
 ---@usage >lua
 ---   -- Start default jumping
@@ -360,6 +362,10 @@ MiniJump2d.config = {
 MiniJump2d.start = function(opts)
   if H.is_disabled() then return end
 
+  -- Initialize cache:
+  H.cache.spots_add_steps = H.cache.spots_add_steps or H.spots_add_steps
+  H.cache.spots_show = H.cache.spots_show or H.spots_show
+
   opts = opts or {}
 
   -- Apply `before_start` before `tbl_deep_extend` to allow it modify options
@@ -381,15 +387,15 @@ MiniJump2d.start = function(opts)
     H.message('No spots to show.')
     return
   end
-  if #spots == 1 then
+  if #spots == 1 and not opts.force_filtering then
     H.perform_jump(spots[1], opts.hooks.after_jump)
     return
   end
 
   local label_tbl = vim.split(opts.labels, '')
-  spots = H.spots_add_steps(spots, label_tbl, opts.view.n_steps_ahead)
+  spots = H.cache.spots_add_steps(spots, label_tbl, opts.view.n_steps_ahead)
 
-  H.spots_show(spots, opts)
+  H.cache.spots_show(spots, opts)
 
   H.cache.spots = spots
 
@@ -401,6 +407,8 @@ MiniJump2d.stop = function()
   H.spots_unshow()
   H.cache.spots = nil
   H.cache.msg_shown = false
+  H.cache.spots_add_steps = nil
+  H.cache.spots_show = nil
   vim.cmd('redraw')
 
   if H.cache.is_in_getcharstr then vim.api.nvim_input('<C-c>') end
@@ -692,6 +700,35 @@ MiniJump2d.builtin_opts.single_character = user_input_opts(
 --- `hooks.before_start`.
 MiniJump2d.builtin_opts.query = user_input_opts(function() return H.input('Enter query to search') end)
 
+--- Call |MiniJump2d.start| with opinionated defaults, extending
+--- |MiniJump2d.builtin_opts.single_character|
+---
+--- Ensures that the second character of each spot is always included in the
+--- generated steps. After user enters first character, the second character
+--- must be typed. That character is **not** shown as a label!
+---
+--- Advantages:
+--- - User immediately sees the generated labels at target position
+---
+--- Disadvantages:
+--- - User must know that two characters are required
+--- - Can't be used with a non-default |MiniJump2dSpotUnique|
+---
+--- Notes:
+--- - Jump is performed immediately if there is only one spot
+--- - If target is last on line, second character is hardcoded to space
+---
+---@param opts table|nil Same as |MiniJump2d.start|
+---   The opts should be taken from |MiniJump2d.builtin_opts.single_character|
+MiniJump2d.start_extended_character = function(opts)
+  if H.is_disabled() then return end
+
+  H.cache.spots_add_steps = H.spots_add_steps_extended
+  H.cache.spots_show = H.spots_show_without_second_character
+
+  MiniJump2d.start(opts)
+end
+
 -- Helper data ================================================================
 -- Module default config
 H.default_config = vim.deepcopy(MiniJump2d.config)
@@ -713,6 +750,12 @@ H.cache = {
 
   -- Whether helper message was shown
   msg_shown = false,
+
+  -- Whether to use a customized H.spots_add_steps
+  spots_add_steps = nil,
+
+  -- Whether to use a customized H.spots_show
+  spots_show = nil,
 }
 
 -- Table with special keys
@@ -840,11 +883,17 @@ H.spots_compute = function(opts)
   return res
 end
 
-H.spots_add_steps = function(spots, label_tbl, n_steps_ahead)
+---@param opts table|nil Allowed fields:
+---   - <init_steps> - function returning an array of initial `steps`.
+---@return nil Modifies `spots` in place.
+---@private
+H.spots_add_steps = function(spots, label_tbl, n_steps_ahead, opts)
+  opts = opts or {}
+
   -- Compute all required steps
   local steps = {}
   for _ = 1, #spots do
-    table.insert(steps, {})
+    table.insert(steps, opts.init_steps == nil and {} or opts.init_steps())
   end
 
   H.populate_spot_steps(steps, label_tbl, 1, n_steps_ahead + 1)
@@ -853,6 +902,31 @@ H.spots_add_steps = function(spots, label_tbl, n_steps_ahead)
     spot.steps = steps[i]
   end
 
+  return spots
+end
+
+H.spots_add_steps_extended = function(spots, label_tbl, n_steps_ahead)
+  local middle_dot = '\194\183'
+  local spots_per_character = {}
+  for _, spot in ipairs(spots) do
+    local line = vim.api.nvim_buf_get_lines(spot.buf_id, spot.line - 1, spot.line, false)[1]
+
+    local char = line:sub(spot.column + 1, spot.column + 1)
+    char = char == '' and ' ' or char -- use space on line end...
+    spots_per_character[char] = spots_per_character[char] or {}
+    table.insert(spots_per_character[char], spot)
+  end
+
+  for char, spots_with_char in pairs(spots_per_character) do
+    if #spots_with_char == 1 then
+      spots_with_char[1].steps = { char, middle_dot } -- indicator for "no generated label"
+    else
+      local opts = { init_steps = function() return { char } end }
+      H.spots_add_steps(spots_with_char, label_tbl, n_steps_ahead, opts)
+    end
+  end
+
+  H.cache.spots_add_steps = H.spots_add_steps -- only override on jump initializer
   return spots
 end
 
@@ -926,6 +1000,27 @@ H.spots_show = function(spots, opts)
 
   -- Redraw to force showing marks
   vim.cmd('redraw')
+end
+
+H.spots_show_without_second_character = function(spots, opts)
+  local remove_first_step = function(spot)
+    local steps = spot.steps
+    if #steps < 2 then return end
+
+    spot.org_steps = steps
+    spot.steps = vim.list_slice(steps, 2)
+  end
+
+  for _, spot in ipairs(spots) do
+    remove_first_step(spot)
+  end
+
+  H.spots_show(spots, opts)
+
+  for _, spot in ipairs(spots) do
+    spot.steps = spot.org_steps or spot.steps -- undo remove
+  end
+  H.cache.spots_show = H.spots_show -- only override on jump initializer
 end
 
 H.spots_unshow = function(spots)
@@ -1041,14 +1136,13 @@ H.advance_jump = function(opts)
   end
 
   local key = H.getcharstr('Enter encoding symbol to advance jump')
-
-  if vim.tbl_contains(label_tbl, key) then
+  if not (key == H.keys.cr or key == H.keys.esc or key == H.keys.block_operator_pending) then
     H.spots_unshow(spots)
     spots = vim.tbl_filter(function(x) return x.steps[1] == key end, spots)
 
     if #spots > 1 then
-      spots = H.spots_add_steps(spots, label_tbl, n_steps_ahead)
-      H.spots_show(spots, opts)
+      spots = H.cache.spots_add_steps(spots, label_tbl, n_steps_ahead)
+      H.cache.spots_show(spots, opts)
       H.cache.spots = spots
 
       H.advance_jump(opts)
