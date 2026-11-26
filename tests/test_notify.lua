@@ -341,10 +341,18 @@ T['add()']['works'] = function()
   eq(notif.ts_update, notif.ts_add)
 end
 
-T['add()']['allows empty string message'] = function()
+T['add()']['works with chunked message'] = function()
+  mock_gettimeofday()
+  local msg = { { { 'Line ' }, { '#1', 'AAA' } }, {}, { { 'Line #3', 'BBB' } } }
+  local id = add(msg)
+  eq(get(id).msg, msg)
+end
+
+T['add()']['allows empty message'] = function()
   mock_gettimeofday()
 
   add('')
+  add({ {} })
   child.expect_screenshot()
 end
 
@@ -365,7 +373,38 @@ T['add()']['respects arguments'] = function()
 end
 
 T['add()']['validates arguments'] = function()
-  expect.error(function() add(1, 'ERROR', 'Comment') end, '`msg`.*string')
+  local validate_bad_msg = function(msg)
+    expect.error(function() add(msg, 'ERROR', 'Comment') end, '`msg`.*string or array of "text%-hl chunk" lines')
+  end
+  validate_bad_msg(1)
+  validate_bad_msg({})
+  validate_bad_msg({ 'a' })
+  validate_bad_msg({ { 1 } })
+  validate_bad_msg({ { 'a' } })
+  validate_bad_msg({ { {} } })
+  validate_bad_msg({ { { 1 } } })
+  validate_bad_msg({ { { 'a', 1 } } })
+  validate_bad_msg({ { { 'b', 'BB' }, 1 } })
+  validate_bad_msg({ { { 'b', 'BB' }, 'a' } })
+  validate_bad_msg({ { { 'b', 'BB' }, {} } })
+  validate_bad_msg({ { { 'b', 'BB' }, { 1 } } })
+  validate_bad_msg({ { { 'b', 'BB' }, { 'a', 1 } } })
+  validate_bad_msg({ { { 'c', 'CC' } }, { 1 } })
+  validate_bad_msg({ { { 'c', 'CC' } }, { 'a' } })
+  validate_bad_msg({ { { 'c', 'CC' } }, { {} } })
+  validate_bad_msg({ { { 'c', 'CC' } }, { { 1 } } })
+  validate_bad_msg({ { { 'c', 'CC' } }, { { 'a', 1 } } })
+
+  local validate_good_msg = function(msg)
+    expect.no_error(function() add(msg, 'INFO', 'Comment') end)
+  end
+  -- - Empty message is allowed
+  validate_good_msg({ {} })
+  -- - No highlight in chunk is allowed
+  validate_good_msg({ { { 'a' } } })
+  -- - Empty lines in a message is allowed
+  validate_good_msg({ { { 'a' } }, {} })
+
   expect.error(function() add('Hello', 1, 'Comment') end, '`level`.*key of `vim%.log%.levels`')
   expect.error(function() add('Hello', 'Error', 'Comment') end, '`level`.*key of `vim%.log%.levels`')
   expect.error(function() add('Hello', 'ERROR', 1) end, '`hl_group`.*string')
@@ -426,6 +465,18 @@ T['update()']['allows partial new content'] = function()
   eq(notif.data, { b = false })
 end
 
+T['update()']['works with chunked message'] = function()
+  mock_gettimeofday()
+
+  -- Should allow setting different type of message
+  local id = add('Hello')
+  eq(get(id).msg, 'Hello')
+  update(id, { msg = { { { 'World' } } } })
+  eq(get(id).msg, { { { 'World' } } })
+  update(id, { msg = 'Wow' })
+  eq(get(id).msg, 'Wow')
+end
+
 T['update()']['can update only active notification'] = function()
   local id = child.lua([[
     local id = MiniNotify.add('Hello')
@@ -439,7 +490,10 @@ T['update()']['validates arguments'] = function()
   local id = add('Hello')
   expect.error(function() update('a', { msg = 'World' }) end, '`id`.*identifier')
   expect.error(function() update(id, 1) end, '`new`.*table')
-  expect.error(function() update(id, { msg = 1 }) end, '`msg`.*string')
+  expect.error(function() update(id, { msg = 1 }) end, '`msg`.*string or array of "text%-hl chunk" lines')
+  expect.error(function() update(id, { msg = {} }) end, '`msg`.*string or array of "text%-hl chunk" lines')
+  expect.error(function() update(id, { msg = { { 'a' } } }) end, '`msg`.*string or array of "text%-hl chunk" lines')
+  -- More thorough `msg` validation tests are done in `add`
   expect.error(function() update(id, { level = 1 }) end, '`level`.*key of `vim%.log%.levels`')
   expect.error(function() update(id, { level = 'Error' }) end, '`level`.*key of `vim%.log%.levels`')
   expect.error(function() update(id, { hl_group = 1 }) end, '`hl_group`.*string')
@@ -612,12 +666,19 @@ T['refresh()']['respects `vim.{g,b}.mininotify_disable`'] = new_set({ parametriz
 
 T['get()'] = new_set()
 
+T['get()']['returns message as is'] = function()
+  local id_string = add('Hello')
+  local id_chunks = add({ { { 'Hello' } } })
+  eq(get(id_string).msg, 'Hello')
+  eq(get(id_chunks).msg, { { { 'Hello' } } })
+end
+
 T['get()']['returns copy'] = function()
   local res = child.lua([[
-    local id = MiniNotify.add('Hello')
+    local id = MiniNotify.add({ { { 'Hello' } } })
     local notif = MiniNotify.get(id)
-    notif.msg = 'Should not change history'
-    return MiniNotify.get(id).msg == 'Hello'
+    notif.msg[1][1][1] = 'Should not change history'
+    return MiniNotify.get(id).msg[1][1][1] == 'Hello'
   ]])
   eq(res, true)
 end
@@ -636,16 +697,22 @@ T['get_all()']['works'] = function()
   eq(history[id_2].msg, 'World')
 end
 
+T['get_all()']['returns message as is'] = function()
+  add('Hello')
+  add({ { { 'Hello' } } })
+  eq(vim.tbl_map(function(notif) return notif.msg end, get_all()), { 'Hello', { { { 'Hello' } } } })
+end
+
 T['get_all()']['returns copy'] = function()
   local res = child.lua([[
     local id_1 = MiniNotify.add('Hello')
-    local id_2 = MiniNotify.add('World')
+    local id_2 = MiniNotify.add({ { { 'World' } } })
     local history = MiniNotify.get_all()
     history[id_1].msg = 'Should not change history'
-    history[id_2].msg = 'Nowhere'
+    history[id_2].msg[1][1][1] = 'Nowhere'
 
     local new_history = MiniNotify.get_all()
-    return new_history[id_1].msg == 'Hello' and new_history[id_2].msg == 'World'
+    return new_history[id_1].msg == 'Hello' and new_history[id_2].msg[1][1][1] == 'World'
   ]])
   eq(res, true)
 end
@@ -668,6 +735,38 @@ T['show_history()']['works'] = function()
   -- Should set proper buffer name and filetype
   eq(child.api.nvim_buf_get_name(0), 'mininotify://' .. child.api.nvim_get_current_buf() .. '/history')
   eq(child.bo.filetype, 'mininotify-history')
+end
+
+T['show_history()']['works with chunked messages'] = function()
+  mock_gettimeofday()
+
+  child.set_size(11, 33)
+  -- This test is aligned with the "main" one in "Window" test set
+  child.api.nvim_set_hl(0, 'AAA', { fg = '#000001' })
+  child.api.nvim_set_hl(0, 'BBB', { fg = '#000002' })
+  child.api.nvim_set_hl(0, 'CCC', { fg = '#000003' })
+  child.api.nvim_set_hl(0, 'xxx', { bg = '#200000' })
+
+  add('Message to add width')
+  add({ { { 'aaa', 'AAA' }, { ' ' }, { 'aaa', 'AAA' } }, {} })
+  add({ { { 'bbb', 'BBB' }, { '', 'BBB' } }, {}, { { '', 'BBB' } } })
+  add({ { { 'ф', 'AAA' }, { '😈', 'BBB' }, { 'ツ', 'AAA' }, { ' ' }, { '😈фツ', 'BBB' } } })
+  add({ { { 'ccc', 'CCC' } } }, 'INFO', 'xxx')
+  clear()
+
+  show_history()
+
+  local row = child.api.nvim_buf_line_count(0)
+  child.bo.modifiable = true
+  child.fn.append('$', 'AAA BBB CCC')
+  local ns_id = child.api.nvim_create_namespace('test')
+  child.api.nvim_buf_set_extmark(0, ns_id, row, 0, { end_row = row, end_col = 11, hl_group = 'MiniNotifyNormal' })
+  child.api.nvim_buf_set_extmark(0, ns_id, row, 0, { end_row = row, end_col = 3, hl_group = 'AAA' })
+  child.api.nvim_buf_set_extmark(0, ns_id, row, 4, { end_row = row, end_col = 7, hl_group = 'BBB' })
+  child.api.nvim_buf_set_extmark(0, ns_id, row, 8, { end_row = row, end_col = 11, hl_group = 'xxx' })
+  child.api.nvim_buf_set_extmark(0, ns_id, row, 8, { end_row = row, end_col = 11, hl_group = 'CCC' })
+
+  child.expect_screenshot()
 end
 
 T['show_history()']['shows all notifications'] = function()
@@ -726,8 +825,29 @@ local default_format = forward_lua('MiniNotify.default_format')
 T['default_format()']['works'] = function()
   mock_gettimeofday()
   -- Should show time, separator, and indent prefix for multiline messages
-  local ref = '12:34:56│ Hello\n        │ World'
-  eq(default_format({ msg = 'Hello\nWorld', ts_update = ref_seconds + ref_microseconds }), ref)
+  -- Should also preserve the type of the message
+  local ts_update = ref_seconds + ref_microseconds
+  local msg = 'Line one\n\nLine three'
+  local msg_ref = '12:34:56│ Line one\n        │ \n        │ Line three'
+  eq(default_format({ msg = msg, ts_update = ts_update }), msg_ref)
+
+  local msg_chunks = { { { 'Line' }, { 'one', 'Bold' } }, {}, { { 'Line three' } } }
+  local msg_chunks_ref = {
+    { { '12:34:56│ ' }, { 'Line' }, { 'one', 'Bold' } },
+    { { '        │ ' } },
+    { { '        │ ' }, { 'Line three' } },
+  }
+  eq(default_format({ msg = msg_chunks, ts_update = ref_seconds + ref_microseconds }), msg_chunks_ref)
+end
+
+T['default_format()']['returns copy'] = function()
+  local res = child.lua([[
+    local msg = { { { 'Hello' } } }
+    local msg_2 = MiniNotify.default_format({ msg = msg, ts_update = 1 })
+    msg_2[1][1][1] = 'World'
+    return msg[1][1][1] == 'Hello'
+  ]])
+  eq(res, true)
 end
 
 T['default_sort()'] = new_set()
@@ -796,6 +916,43 @@ end
 T['Window']['works with multiline messages'] = function()
   add('Hello\nBrave\nWorld')
   add('Hello\nAgain')
+  child.expect_screenshot()
+end
+
+T['Window']['works with chunked messages'] = function()
+  child.lua('MiniNotify.config.window.max_width_share = 0.75')
+  child.api.nvim_set_hl(0, 'AAA', { fg = '#000001' })
+  child.api.nvim_set_hl(0, 'BBB', { fg = '#000002' })
+  child.api.nvim_set_hl(0, 'CCC', { fg = '#000003' })
+  child.api.nvim_set_hl(0, 'xxx', { bg = '#200000' })
+
+  -- Should be able to show both string and chunked messages
+  add('Message to add width')
+
+  -- Regular "array of text-hl chunk lines" with empty line
+  add({ { { 'aaa', 'AAA' }, { ' ' }, { 'aaa', 'AAA' } }, {} })
+  -- Last chunk in line with empty string should highlight till end-of-line
+  add({ { { 'bbb', 'BBB' }, { '', 'BBB' } }, {}, { { '', 'BBB' } } })
+  -- Should work with multibyte and multicell characters
+  add({ { { 'ф', 'AAA' }, { '😈', 'BBB' }, { 'ツ', 'AAA' }, { ' ' }, { '😈фツ', 'BBB' } } })
+  -- Should combine with base highlight group
+  add({ { { 'ccc', 'CCC' } } }, 'INFO', 'xxx')
+
+  -- NOTE: add reference regions to check that proper groups are used
+  -- Adding them directly and not in the regular buffer is the most robust way
+  local win_id = get_notif_win_id()
+  local buf_id = child.api.nvim_win_get_buf(win_id)
+  local row = child.api.nvim_buf_line_count(buf_id)
+  child.api.nvim_set_option_value('modifiable', true, { buf = buf_id })
+  child.fn.appendbufline(buf_id, '$', 'AAA BBB CCC')
+
+  local ns_id = child.api.nvim_create_namespace('test')
+  child.api.nvim_buf_set_extmark(buf_id, ns_id, row, 0, { end_row = row, end_col = 3, hl_group = 'AAA' })
+  child.api.nvim_buf_set_extmark(buf_id, ns_id, row, 4, { end_row = row, end_col = 7, hl_group = 'BBB' })
+  child.api.nvim_buf_set_extmark(buf_id, ns_id, row, 8, { end_row = row, end_col = 11, hl_group = 'xxx' })
+  child.api.nvim_buf_set_extmark(buf_id, ns_id, row, 8, { end_row = row, end_col = 11, hl_group = 'CCC' })
+
+  child.api.nvim_win_set_config(win_id, { height = child.api.nvim_win_get_config(win_id).height + 1 })
   child.expect_screenshot()
 end
 
